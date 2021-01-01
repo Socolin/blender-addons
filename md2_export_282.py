@@ -20,9 +20,8 @@ bl_info = {
     "name": "Export .md2",
     "description": "Export to Quake2 file format, applies modifiers (.md2)",
     "author": "Sebastian Lieberknecht, Dao Nguyen and Bernd Meyer metaio GmbH (based on Damien Thebault and Erwan Mathieu's Blender2.4x exporter)",
-    "version": (1, 6),
-    "blender": (2, 6, 3),
-    "api": 46461,
+    "version": (1, 7, 1),
+    "blender": (2, 82, 0),
     "location": "File > Export > md2",
     "warning": '',  # used for warning icon and text in addons panel
     "wiki_url": "http://metaio.com",
@@ -30,7 +29,6 @@ bl_info = {
     "category": "Import-Export"}
 
 import bpy
-from bpy.props import *
 
 from bpy_extras.io_utils import ExportHelper
 from datetime import datetime
@@ -233,8 +231,8 @@ class MD2:
 
         self.num_skins = len(skins)
         self.num_xyz = len(mesh.vertices)
-        self.num_st = len(mesh.tessfaces) * 3
-        self.num_tris = len(mesh.tessfaces)
+        self.num_st = len(mesh.loop_triangles) * 3
+        self.num_tris = len(mesh.loop_triangles)
         self.num_glcmds = self.num_tris * (1 + 3 * 3) + 1
 
         self.num_frames = 1
@@ -306,31 +304,22 @@ class MD2:
                 bin = struct.pack('<64s', bytes(fnImg[0:63], encoding='utf8'))
                 file.write(bin)  # skin name
 
-            # define meshTextureFaces
-            if len(mesh.tessface_uv_textures) != 0:
-                meshTextureFaces = mesh.tessface_uv_textures[0].data
-            else:
-                meshTextureFaces = mesh.tessfaces  # does this make sense?
+            for tri in mesh.loop_triangles:  # for face in mesh.faces:
+                for loop_index in tri.loops:
+                    try:
+                        uv = mesh.uv_layers[0].data[loop_index].uv
+                    except:
+                        uv = [0, 0]
 
-            for meshTextureFace in meshTextureFaces:  # for face in mesh.faces:
-                try:
-                    uvs = meshTextureFace.uv
-                except:
-                    uvs = ([0, 0], [0, 0], [0, 0])
+                    # (u,v) in blender -> (u,1-v)
+                    bin = struct.pack('<2h',
+                                      int(uv[0] * self.skinwidth),
+                                      int((1 - uv[1]) * self.skinheight),
+                                      )
+                    file.write(bin)  # uv
+                # (uv index is : face.index*3+i)
 
-                # (u,v) in blender -> (u,1-v)
-                bin = struct.pack('<6h',
-                                  int(uvs[0][0] * self.skinwidth),
-                                  int((1 - uvs[0][1]) * self.skinheight),
-                                  int(uvs[1][0] * self.skinwidth),
-                                  int((1 - uvs[1][1]) * self.skinheight),
-                                  int(uvs[2][0] * self.skinwidth),
-                                  int((1 - uvs[2][1]) * self.skinheight),
-                                  )
-                file.write(bin)  # uv
-            # (uv index is : face.index*3+i)
-
-            for face in mesh.tessfaces:
+            for face in mesh.loop_triangles:
                 # 0,2,1 for good cw/ccw
                 bin = struct.pack('<3H',
                                   face.vertices[0],
@@ -397,12 +386,15 @@ class MD2:
             else:
                 self.outFrame(file)
 
-            # gl commands
-            for meshTextureFace in meshTextureFaces:
-                try:
-                    uvs = meshTextureFace.uv
-                except:
-                    uvs = ([0, 0], [0, 0], [0, 0])
+            for tri in mesh.loop_triangles:  # for face in mesh.faces:
+                uvs = []
+                for loop_index in tri.loops:
+                    try:
+                        uv = mesh.uv_layers[0].data[loop_index].uv
+                    except:
+                        uv = [0, 0]
+                    uvs.append(uv)
+
                 bin = struct.pack('<i', 3)
                 file.write(bin)
                 # 0,2,1 for good cw/ccw (also flips/inverts normal)
@@ -411,7 +403,7 @@ class MD2:
                     bin = struct.pack('<ffI',
                                       uvs[vert][0],
                                       (1.0 - uvs[vert][1]),
-                                      face.vertices[vert])
+                                      tri.vertices[vert])
 
                     file.write(bin)
             # NULL command
@@ -421,7 +413,7 @@ class MD2:
             file.close()
 
     def outFrame(self, file, frameName='frame'):
-        mesh = self.object.to_mesh(bpy.context.scene, True, 'PREVIEW')
+        mesh = self.object.to_mesh(preserve_all_data_layers=True)
 
         mesh.transform(self.object.matrix_world)
         mesh.transform(mathutils.Matrix.Rotation(pi / 2, 4, 'X'))
@@ -468,6 +460,8 @@ class MD2:
 
         file.write(bin)  # frame header
 
+        # Vertices
+
         for vert in mesh.vertices:
 
             # find the closest normal for every vertex
@@ -500,7 +494,7 @@ class Util:
     # deletes an object from Blender (remove + unlink)
     @staticmethod
     def deleteObject(object):
-        bpy.context.scene.objects.unlink(object)
+        bpy.context.collection.objects.unlink(object)
         bpy.data.objects.remove(object)
 
     # duplicates the given object and returns it
@@ -513,7 +507,7 @@ class Util:
         # deselect all selected objects
         bpy.ops.object.select_all(action='DESELECT')
         # select the object which we want to duplicate
-        object.select = True
+        object.select_set(state=True)
 
         # duplicate the selected object
         bpy.ops.object.duplicate()
@@ -525,9 +519,9 @@ class Util:
         copyObj.name = name
 
         # select all objects which have been previously selected and make active the previous active object
-        bpy.context.scene.objects.active = actObject
+        bpy.context.view_layer.objects.active = actObject
         for obj in selObjects:
-            obj.select = True
+            obj.select_set(state=True)
 
         return copyObj
 
@@ -538,9 +532,11 @@ class Util:
         actObject = bpy.context.active_object
 
         # deselect all selected objects
-        bpy.ops.object.select_all(action='DESELECT')
+        for o in bpy.context.scene.objects:
+            if not o.hide_viewport:
+                object.select_set(state=False)
         # select the object which we want to apply modifiers to
-        object.select = True
+        object.select_set(state=True)
 
         # duplicate the selected object
         bpy.ops.object.duplicate()
@@ -558,9 +554,9 @@ class Util:
             bpy.ops.object.modifier_apply(modifier=modifier.name)
 
         # select all objects which have been previously selected and make active the previous active object
-        bpy.context.scene.objects.active = actObject
+        bpy.context.view_layer.objects.active = actObject
         for obj in selObjects:
-            obj.select = True
+            obj.select_set(state=True)
 
         if modifiedObj.name == object.name:
             # no modifier applied.
@@ -577,7 +573,7 @@ class Util:
         mesh = object.data
 
         # make the object the active object!
-        bpy.context.scene.objects.active = object
+        bpy.context.view_layer.objects.active = object
 
         bpy.ops.object.mode_set(mode="EDIT", toggle=False)
         bpy.ops.mesh.select_all(action="SELECT")
@@ -585,18 +581,21 @@ class Util:
         bpy.ops.mesh.quads_convert_to_tris()
         bpy.ops.object.mode_set(mode="OBJECT", toggle=False)
 
-        mesh.update(calc_tessface=True)
+        # FIXME
+        # mesh.update(calc_tessface=True)
+        mesh.calc_loop_triangles()
+
+        print(mesh)
         return mesh
 
     @staticmethod
     def getSkins(mesh):
         skins = []
         for material in mesh.materials:
-            for texSlot in material.texture_slots:
-                if not texSlot or texSlot.texture.type != "IMAGE":
+            for texSlot in material.node_tree.nodes:
+                if not texSlot or texSlot.type != "TEX_IMAGE":
                     continue
-
-                skins.append(texSlot.texture.image.filepath)
+                skins.append(texSlot.image.filepath)
 
         return skins
 
@@ -625,48 +624,48 @@ class ObjectInfo:
                     object = Util.duplicateObject(object, tmpObjectName)
                 mesh = Util.triangulateMesh(object)
 
-                self.status = (str(len(mesh.vertices)) + ' vertices', str(len(mesh.tessfaces)) + ' faces')
-                self.cTessFaces = len(mesh.tessfaces)
+                self.status = (str(len(mesh.vertices)) + ' vertices', str(len(mesh.loop_triangles)) + ' faces')
+                self.cTessFaces = len(mesh.loop_triangles)
                 self.vertices = len(mesh.vertices)
 
             finally:
                 if object.name == tmpObjectName:
-                    originalObject.select = True
-                    bpy.context.scene.objects.active = originalObject
+                    originalObject.select_set(state=True)
+                    bpy.context.view_layer.objects.active = originalObject
                     Util.deleteObject(object)
         print(self.status)
 
 
-class Export_MD2(bpy.types.Operator, ExportHelper):
+class OBJECT_OT_Export_MD2(bpy.types.Operator, ExportHelper):
     """Export to Quake2 file format (.md2)"""
     bl_idname = "export_quake.md2"
     bl_label = "Export to Quake2 file format (.md2)"
 
-    filename = StringProperty(name="File Path",
-                              description="Filepath used for processing the script",
-                              maxlen=1024, default="")
+    filename: bpy.props.StringProperty(name="File Path",
+                                       description="Filepath used for processing the script",
+                                       maxlen=1024, default="")
 
     filename_ext = ".md2"
 
-    rScaleFactor = FloatProperty(name="Scale for blenderUnits -> [mm]",
-                                 description="Defaults to 1000 (blender unit -> [mm])",
-                                 default=1000.0)
+    rScaleFactor: bpy.props.FloatProperty(name="Scale for blenderUnits -> [mm]",
+                                          description="Defaults to 1000 (blender unit -> [mm])",
+                                          default=1000.0)
 
-    fExportAnimation = BoolProperty(name="Export animation",
-                                    description="default: False",
-                                    default=False)
+    fExportAnimation: bpy.props.BoolProperty(name="Export animation",
+                                             description="default: False",
+                                             default=False)
 
-    fExportOnlyTextureBasename = BoolProperty(name="Export only basenames (skin)",
-                                              description="default: True",
-                                              default=True)
+    fExportOnlyTextureBasename: bpy.props.BoolProperty(name="Export only basenames (skin)",
+                                                       description="default: True",
+                                                       default=True)
 
-    fCopyTextureSxS = BoolProperty(name="Copy texture(s) next to .md2",
-                                   description="default: True",
-                                   default=True)
+    fCopyTextureSxS: bpy.props.BoolProperty(name="Copy texture(s) next to .md2",
+                                            description="default: True",
+                                            default=True)
 
-    fNameTextureToMD2Filename = BoolProperty(name="Name first texture similar to .md2",
-                                             description="default: True",
-                                             default=True)
+    fNameTextureToMD2Filename: bpy.props.BoolProperty(name="Name first texture similar to .md2",
+                                                      description="default: True",
+                                                      default=True)
 
     # id_export   = 1
     # id_cancel   = 2
@@ -682,12 +681,14 @@ class Export_MD2(bpy.types.Operator, ExportHelper):
             self.object = None
 
         # go into object mode before we start the actual export procedure
-        bpy.ops.object.mode_set(mode="OBJECT", toggle=False)
+        # FIXME
+        # bpy.ops.object.mode_set(mode="OBJECT", toggle=False)
 
-        self.info = ObjectInfo(self.object)
+        # FIXME
+        # self.info = ObjectInfo(self.object)
 
     def execute(self, context):
-
+        self.info = ObjectInfo(self.object)
         props = self.properties
         filepath = self.filepath
         filepath = bpy.path.ensure_ext(filepath, self.filename_ext)
@@ -720,8 +721,8 @@ class Export_MD2(bpy.types.Operator, ExportHelper):
             md2.write(filepath)
         finally:
             if object.name == tmpObjectName:
-                originalObject.select = True
-                bpy.context.scene.objects.active = originalObject
+                originalObject.select_set(state=True)
+                bpy.context.view_layer.objects.active = originalObject
                 Util.deleteObject(object)
             if self.fExportAnimation:
                 bpy.context.scene.frame_set(frame)
@@ -747,7 +748,7 @@ class Export_MD2(bpy.types.Operator, ExportHelper):
         if cFinalTriangles * 3 > 2 ** 16:
             self.report({'ERROR'},
                         "Object has too many (triangulated) faces (%i), at most %i are supported in md2" % (
-                        cFinalTriangles, (2 ** 16) / 3))
+                            cFinalTriangles, (2 ** 16) / 3))
             return {'CANCELLED'}
 
         wm = context.window_manager
@@ -756,17 +757,26 @@ class Export_MD2(bpy.types.Operator, ExportHelper):
 
 
 def menuCB(self, context):
-    self.layout.operator(Export_MD2.bl_idname, text="MD2 (.md2)")
+    self.layout.operator(OBJECT_OT_Export_MD2.bl_idname, text="MD2 (.md2)")
+
+
+classes = (
+    OBJECT_OT_Export_MD2,
+)
 
 
 def register():
-    bpy.utils.register_module(__name__)
-    bpy.types.INFO_MT_file_export.append(menuCB)
+    from bpy.utils import register_class
+    for cls in classes:
+        register_class(cls)
+    bpy.types.TOPBAR_MT_file_export.append(menuCB)
 
 
 def unregister():
-    bpy.utils.unregister_module(__name__)
-    bpy.types.INFO_MT_file_export.remove(menuCB)
+    from bpy.utils import unregister_class
+    for cls in reversed(classes):
+        unregister_class(cls)
+    bpy.types.TOPBAR_MT_file_export.remove(menuCB)
 
 
 if __name__ == "__main__":
